@@ -17,6 +17,11 @@ public class TlGroupDto
     public string Name { get; set; } = "";
     public string Color { get; set; } = "#35DDAC"; // #RRGGBB
     public bool Visible { get; set; } = true;
+    // Persisted in the per-world file so chat-imported groups (which have no
+    // backing drop-folder file to re-read) survive a reload/restart. Left at
+    // default false in shared/export files; the receiver rebuilds import groups
+    // from per-entry Origin, so the flag there is irrelevant.
+    public bool Imported { get; set; }
 }
 
 public class TlEntryDto
@@ -183,7 +188,7 @@ public class TranslocatorStore
                 _groups[g.Id] = new TlGroup
                 {
                     Id = g.Id, Name = g.Name, Visible = g.Visible,
-                    Color = ParseColor(g.Color), Imported = false,
+                    Color = ParseColor(g.Color), Imported = g.Imported,
                 };
             EnsureSelfGroup();
             foreach (var e in f.Entries)
@@ -224,12 +229,16 @@ public class TranslocatorStore
         _dirty = false;
         try
         {
+            // Persist EVERYTHING, including imported groups/entries. Drop-folder
+            // imports re-read harmlessly (dedup on key), but chat imports have no
+            // file to re-read, so excluding them here is what made them vanish on
+            // reload/restart.
             var f = new TlSaveFile
             {
                 SavegameId = SavegameId,
                 Owner = PlayerName,
-                Groups = _groups.Values.Where(g => !g.Imported).Select(ToDto).ToList(),
-                Entries = _entries.Values.Where(e => !IsImportedGroup(e.GroupId)).Select(ToDto).ToList(),
+                Groups = _groups.Values.Select(ToDto).ToList(),
+                Entries = _entries.Values.Select(ToDto).ToList(),
             };
             File.WriteAllText(_worldFile, JsonSerializer.Serialize(f, JsonOpts));
         }
@@ -260,6 +269,7 @@ public class TranslocatorStore
     private static TlGroupDto ToDto(TlGroup g) => new()
     {
         Id = g.Id, Name = g.Name, Visible = g.Visible, Color = "#" + ToHex(g.Color),
+        Imported = g.Imported,
     };
 
     private static TlEntryDto ToDto(TlEntry e) => new()
