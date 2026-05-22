@@ -13,8 +13,8 @@ it teleports you to, so you can see your translocator network at a glance.
 - **Per-world save** — discovered translocators are saved automatically per
   savegame.
 - **Sharing** — export your list (whole list or a single group) to a drop
-  folder others can import, or upload to [paste.rs](https://paste.rs/) and post
-  the link in chat for one-click import by anyone who has opted in.
+  folder others can import, or 1-click upload to [paste.rs](https://paste.rs/) & auto-post
+  the link in chat for auto-import by anyone who has opted in.
 - **In-game GUI** — open with the `K` hotkey (or `.tlgui`) to manage groups and
   reassign translocators. Right-click a translocator endpoint on the map to
   change its group directly.
