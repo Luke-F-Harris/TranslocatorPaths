@@ -1,0 +1,14 @@
+{
+  "type": "code",
+  "modid": "translocatorpaths",
+  "name": "TranslocatorPaths",
+  "authors": ["patru"],
+  "description": "Draws lines on the world map from each repaired static translocator to where it teleports. Colour-coded groups, per-world save, drop-folder sharing, and an in-game GUI to manage groups and reassign translocators.",
+  "version": "1.1.0",
+  "side": "Client",
+  "requiredOnClient": false,
+  "requiredOnServer": false,
+  "dependencies": {
+    "game": "1.22.0"
+  }
+}
