@@ -30,13 +30,40 @@ public class TranslocatorPathLayer : MapLayer
     private readonly HashSet<long> _scannedChunks = new();
     private readonly object _scanLock = new();
 
-    private MeshRef? _quad;
-    private readonly Matrixf _mat = new();
     private long _scanListenerId;
 
     // Reused per-frame to avoid 2 * MaxLinks * fps allocations in Render.
     private readonly Vec4f _lineCol = new();
     private readonly Vec4f _endCol = new();
+
+    /// <summary>One mesh pair per group colour: every line quad of that colour
+    /// in one mesh, every endpoint marker in another. A frame then renders in
+    /// 2 draw calls per distinct colour instead of 3 per translocator (which
+    /// was 6000 draw calls + 12000 uniform uploads at the default 2000-link
+    /// cap). Vertices are written in final screen space, so no per-quad
+    /// model matrix is needed.</summary>
+    private sealed class ColorBatch
+    {
+        // xyz + uv, no normals/rgba/flags - same vertex layout the previous
+        // QuadMeshUtil.GetQuad() single-quad path fed the Gui shader.
+        public readonly MeshData Lines = new(64, 96, false, true, false, false);
+        public readonly MeshData Markers = new(64, 96, false, true, false, false);
+        public MeshRef? LinesRef;
+        public MeshRef? MarkersRef;
+        public int LinesCapacity;
+        public int MarkersCapacity;
+        public readonly Vec4f Rgb = new();
+        public bool Used;
+
+        public void DisposeRefs()
+        {
+            LinesRef?.Dispose(); LinesRef = null; LinesCapacity = 0;
+            MarkersRef?.Dispose(); MarkersRef = null; MarkersCapacity = 0;
+        }
+    }
+
+    private readonly Dictionary<int, ColorBatch> _batches = new();
+    private readonly List<int> _deadBatches = new();
 
     public static float ScanIntervalSec = 3f;
     public static int MaxLinks = 2000;
@@ -155,16 +182,15 @@ public class TranslocatorPathLayer : MapLayer
         var items = store.SnapshotVisible();
         if (items.Count == 0) return;
 
-        _quad ??= _capi.Render.UploadMesh(QuadMeshUtil.GetQuad());
-
         var api = map.Api;
-        IShaderProgram prog = api.Render.GetEngineShader(EnumShaderProgram.Gui);
-        prog.Uniform("extraGlow", 0);
-        prog.Uniform("applyColor", 0);
-        prog.Uniform("noTexture", 1f);
-        prog.UniformMatrix("projectionMatrix", api.Render.CurrentProjectionMatrix);
 
-        api.Render.PushScissor(map.Bounds, true);
+        // ---- CPU pass: fill one mesh pair per distinct group colour --------
+        foreach (var b in _batches.Values)
+        {
+            b.Used = false;
+            b.Lines.Clear();
+            b.Markers.Clear();
+        }
 
         var aPos = new Vec2f();
         var bPos = new Vec2f();
@@ -193,28 +219,94 @@ public class TranslocatorPathLayer : MapLayer
             if (len < 0.001f) continue;
             float ang = (float)Math.Atan2(dy, dx);
 
-            var rgb = item.Color;
-            _lineCol.Set(rgb.R, rgb.G, rgb.B, 0.55f);
-            _endCol.Set(rgb.R, rgb.G, rgb.B, 1f);
+            int colKey = TranslocatorStore.ColorToInt(item.Color);
+            if (!_batches.TryGetValue(colKey, out var batch))
+            {
+                batch = new ColorBatch();
+                batch.Rgb.Set(item.Color.R, item.Color.G, item.Color.B, 1f);
+                _batches[colKey] = batch;
+            }
+            batch.Used = true;
 
-            DrawQuad(api, prog, (ax + bx) / 2f, (ay + by) / 2f, ang,
-                len / 2f, LineThicknessPx / 2f, _lineCol);
-            DrawQuad(api, prog, ax, ay, 0f, MarkerSizePx / 2f, MarkerSizePx / 2f, _endCol);
-            DrawQuad(api, prog, bx, by, 0f, MarkerSizePx / 3f, MarkerSizePx / 3f, _endCol);
+            AddQuad(batch.Lines, (ax + bx) / 2f, (ay + by) / 2f, ang,
+                len / 2f, LineThicknessPx / 2f);
+            AddQuad(batch.Markers, ax, ay, 0f, MarkerSizePx / 2f, MarkerSizePx / 2f);
+            AddQuad(batch.Markers, bx, by, 0f, MarkerSizePx / 3f, MarkerSizePx / 3f);
         }
+
+        // ---- GPU pass: upload + draw each used batch -----------------------
+        IShaderProgram prog = api.Render.GetEngineShader(EnumShaderProgram.Gui);
+        prog.Uniform("extraGlow", 0);
+        prog.Uniform("applyColor", 0);
+        prog.Uniform("noTexture", 1f);
+        prog.UniformMatrix("projectionMatrix", api.Render.CurrentProjectionMatrix);
+        prog.UniformMatrix("modelViewMatrix", api.Render.CurrentModelviewMatrix);
+
+        api.Render.PushScissor(map.Bounds, true);
+
+        _deadBatches.Clear();
+        foreach (var kv in _batches)
+        {
+            var b = kv.Value;
+            if (!b.Used)
+            {
+                // Colour vanished (group recoloured/hidden); free its buffers
+                // rather than holding GPU memory for every colour ever seen.
+                b.DisposeRefs();
+                _deadBatches.Add(kv.Key);
+                continue;
+            }
+            if (b.Lines.VerticesCount == 0) continue;
+
+            b.LinesRef = UploadOrUpdate(b.LinesRef, b.Lines, ref b.LinesCapacity);
+            b.MarkersRef = UploadOrUpdate(b.MarkersRef, b.Markers, ref b.MarkersCapacity);
+
+            _lineCol.Set(b.Rgb.R, b.Rgb.G, b.Rgb.B, 0.55f);
+            prog.Uniform("rgbaIn", _lineCol);
+            api.Render.RenderMesh(b.LinesRef);
+
+            _endCol.Set(b.Rgb.R, b.Rgb.G, b.Rgb.B, 1f);
+            prog.Uniform("rgbaIn", _endCol);
+            api.Render.RenderMesh(b.MarkersRef);
+        }
+        foreach (int key in _deadBatches) _batches.Remove(key);
 
         api.Render.PopScissor();
     }
 
-    private void DrawQuad(ICoreClientAPI api, IShaderProgram prog,
-        float cx, float cy, float angle, float halfW, float halfH, Vec4f color)
+    /// <summary>Append a rotated rectangle (centre, angle, half extents) to
+    /// <paramref name="mesh"/> as 4 screen-space vertices + 2 triangles.
+    /// z=60 matches the depth the old per-quad model matrix translated to.</summary>
+    private static void AddQuad(MeshData mesh, float cx, float cy, float angle,
+        float halfW, float halfH)
     {
-        _mat.Set(api.Render.CurrentModelviewMatrix).Translate(cx, cy, 60f);
-        if (angle != 0f) _mat.RotateZ(angle);
-        _mat.Scale(halfW, halfH, 0f);
-        prog.Uniform("rgbaIn", color);
-        prog.UniformMatrix("modelViewMatrix", _mat.Values);
-        api.Render.RenderMesh(_quad);
+        float cos = (float)Math.Cos(angle), sin = (float)Math.Sin(angle);
+        float axx = cos * halfW, axy = sin * halfW;   // half vector along the quad
+        float pxx = -sin * halfH, pxy = cos * halfH;  // half vector across the quad
+
+        int v = mesh.VerticesCount;
+        mesh.AddVertex(cx - axx - pxx, cy - axy - pxy, 60f, 0f, 0f);
+        mesh.AddVertex(cx + axx - pxx, cy + axy - pxy, 60f, 1f, 0f);
+        mesh.AddVertex(cx + axx + pxx, cy + axy + pxy, 60f, 1f, 1f);
+        mesh.AddVertex(cx - axx + pxx, cy - axy + pxy, 60f, 0f, 1f);
+        mesh.AddIndex(v); mesh.AddIndex(v + 1); mesh.AddIndex(v + 2);
+        mesh.AddIndex(v); mesh.AddIndex(v + 2); mesh.AddIndex(v + 3);
+    }
+
+    /// <summary>Upload the mesh data, reusing the existing GPU buffer via
+    /// UpdateMesh while the data still fits and re-allocating when it grew
+    /// past what was uploaded. The GPU buffer is sized by UploadMesh to the
+    /// data it was created with, so that count is the reuse limit.</summary>
+    private MeshRef UploadOrUpdate(MeshRef? mref, MeshData data, ref int capacity)
+    {
+        if (mref == null || data.VerticesCount > capacity)
+        {
+            mref?.Dispose();
+            capacity = data.VerticesCount;
+            return _capi!.Render.UploadMesh(data);
+        }
+        _capi!.Render.UpdateMesh(mref, data);
+        return mref;
     }
 
     private static bool OffSameSide(double a, double b, double lo, double hi)
@@ -303,8 +395,8 @@ public class TranslocatorPathLayer : MapLayer
     {
         if (_capi != null && _scanListenerId != 0)
             _capi.Event.UnregisterGameTickListener(_scanListenerId);
-        _quad?.Dispose();
-        _quad = null;
+        foreach (var b in _batches.Values) b.DisposeRefs();
+        _batches.Clear();
         base.Dispose();
     }
 }
