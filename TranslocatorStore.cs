@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.Tasks;
 using Vintagestory.API.Client;
 using Vintagestory.API.MathTools;
 
@@ -95,6 +96,19 @@ public class TranslocatorStore
     private string _shareDir = "";
     private string _worldFile = "";
     private bool _dirty;
+
+    // Lazily rebuilt per-group entry counts; nulled by any mutation that can
+    // move entries between groups. The GUI calls CountIn once per group row
+    // AND once per dropdown label on every rebuild, which was
+    // O(groups x entries) per click with the old full scan.
+    private Dictionary<string, int>? _countsByGroup;
+
+    // Save-file writes happen off the main thread; _ioLock serialises them
+    // and the sequence numbers make sure an older snapshot never overwrites
+    // a newer one if Task.Run scheduling reorders two saves.
+    private readonly object _ioLock = new();
+    private int _saveSeq;
+    private int _writtenSeq;
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -202,6 +216,7 @@ public class TranslocatorStore
                     Origin = e.Origin ?? "",
                 };
             }
+            _countsByGroup = null;
         }
         catch (Exception ex)
         {
@@ -209,42 +224,77 @@ public class TranslocatorStore
         }
     }
 
-    public void SaveIfDirty()
+    public void SaveIfDirty() => SaveIfDirty(false);
+
+    /// <summary>Save if dirty. The JSON is serialised under the store lock
+    /// (cheap), but the file write - the part that grows with list size and
+    /// hits the disk - runs on the thread pool unless
+    /// <paramref name="synchronous"/> is set. Pass true on shutdown paths
+    /// (LeaveWorld/Dispose) where the process may exit before a queued task
+    /// runs.</summary>
+    public void SaveIfDirty(bool synchronous)
     {
+        string json;
+        int seq;
         lock (_lock)
         {
             if (!_dirty) return;
-            WriteWorldFileLocked();
+            _dirty = false;
+            json = BuildWorldFileJsonLocked();
+            seq = ++_saveSeq;
         }
+        if (synchronous) WriteWorldFile(json, seq);
+        else Task.Run(() => WriteWorldFile(json, seq));
     }
 
-    /// <summary>Force a write even if not dirty (GUI "Save Now" button).</summary>
+    /// <summary>Force a write even if not dirty (GUI "Save Now" button).
+    /// Stays synchronous: callers (export, share) read the state right
+    /// after and expect the file to be current.</summary>
     public void ForceSave()
     {
-        lock (_lock) WriteWorldFileLocked();
+        string json;
+        int seq;
+        lock (_lock)
+        {
+            _dirty = false;
+            json = BuildWorldFileJsonLocked();
+            seq = ++_saveSeq;
+        }
+        WriteWorldFile(json, seq);
     }
 
-    private void WriteWorldFileLocked()
+    private string BuildWorldFileJsonLocked()
     {
-        _dirty = false;
-        try
+        // Persist EVERYTHING, including imported groups/entries. Drop-folder
+        // imports re-read harmlessly (dedup on key), but chat imports have no
+        // file to re-read, so excluding them here is what made them vanish on
+        // reload/restart.
+        var f = new TlSaveFile
         {
-            // Persist EVERYTHING, including imported groups/entries. Drop-folder
-            // imports re-read harmlessly (dedup on key), but chat imports have no
-            // file to re-read, so excluding them here is what made them vanish on
-            // reload/restart.
-            var f = new TlSaveFile
+            SavegameId = SavegameId,
+            Owner = PlayerName,
+            Groups = _groups.Values.Select(ToDto).ToList(),
+            Entries = _entries.Values.Select(ToDto).ToList(),
+        };
+        return JsonSerializer.Serialize(f, JsonOpts);
+    }
+
+    private void WriteWorldFile(string json, int seq)
+    {
+        lock (_ioLock)
+        {
+            // A newer snapshot already reached the disk; dropping this one
+            // keeps last-write-wins semantics under Task.Run reordering.
+            if (seq <= _writtenSeq) return;
+            _writtenSeq = seq;
+            try
             {
-                SavegameId = SavegameId,
-                Owner = PlayerName,
-                Groups = _groups.Values.Select(ToDto).ToList(),
-                Entries = _entries.Values.Select(ToDto).ToList(),
-            };
-            File.WriteAllText(_worldFile, JsonSerializer.Serialize(f, JsonOpts));
-        }
-        catch (Exception ex)
-        {
-            _capi.Logger.Warning($"[translocatorpath] save failed: {ex.Message}");
+                File.WriteAllText(_worldFile, json);
+            }
+            catch (Exception ex)
+            {
+                _capi.Logger.Warning($"[translocatorpath] save failed: {ex.Message}");
+            }
         }
     }
 
@@ -257,6 +307,7 @@ public class TranslocatorStore
         {
             _entries.Clear();
             _groups.Clear();
+            _countsByGroup = null;
             EnsureSelfGroup();
             LoadWorldFile();
         }
@@ -309,6 +360,7 @@ public class TranslocatorStore
             {
                 Src = src, Dst = dst, GroupId = SelfGroupId, Origin = "", ChunkIdx = chunkIdx,
             };
+            _countsByGroup = null;
             _dirty = true;
             return true;
         }
@@ -322,6 +374,7 @@ public class TranslocatorStore
                                             && string.IsNullOrEmpty(kv.Value.Origin))
                                 .Select(kv => kv.Key).ToList();
             foreach (var k in gone) _entries.Remove(k);
+            if (gone.Count > 0) _countsByGroup = null;
         }
     }
 
@@ -416,6 +469,7 @@ public class TranslocatorStore
             };
             added++;
         }
+        if (added > 0) _countsByGroup = null;
         return added;
     }
 
@@ -561,7 +615,19 @@ public class TranslocatorStore
 
     public int CountIn(string gid)
     {
-        lock (_lock) return _entries.Values.Count(e => e.GroupId == gid);
+        lock (_lock)
+        {
+            if (_countsByGroup == null)
+            {
+                _countsByGroup = new Dictionary<string, int>();
+                foreach (var e in _entries.Values)
+                {
+                    _countsByGroup.TryGetValue(e.GroupId, out int n);
+                    _countsByGroup[e.GroupId] = n + 1;
+                }
+            }
+            return _countsByGroup.TryGetValue(gid, out int c) ? c : 0;
+        }
     }
 
     public TlGroup? FindGroupByName(string name)
@@ -640,6 +706,7 @@ public class TranslocatorStore
             foreach (var e in _entries.Values.Where(e => e.GroupId == g.Id))
                 e.GroupId = SelfGroupId;
             _groups.Remove(g.Id);
+            _countsByGroup = null;
             _dirty = true;
             return true;
         }
@@ -669,6 +736,7 @@ public class TranslocatorStore
             if (best == null) return (false, null);
             best.GroupId = g.Id;
             best.Origin = "";
+            _countsByGroup = null;
             _dirty = true;
             return (true, best.Src);
         }
@@ -684,6 +752,7 @@ public class TranslocatorStore
             if (!_groups.ContainsKey(groupId)) return false;
             e.GroupId = groupId;
             if (!IsImportedGroup(groupId)) e.Origin = ""; // now player-owned
+            _countsByGroup = null;
             _dirty = true;
             return true;
         }

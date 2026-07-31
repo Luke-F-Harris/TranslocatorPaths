@@ -106,7 +106,9 @@ public class TranslocatorPathModSystem : ModSystem
             Store.Init();
         };
         api.Event.RegisterGameTickListener(_ => Store?.SaveIfDirty(), 5000);
-        api.Event.LeaveWorld += () => Store?.SaveIfDirty();
+        // Synchronous on the way out: a Task.Run write queued here could be
+        // abandoned when the process exits.
+        api.Event.LeaveWorld += () => Store?.SaveIfDirty(synchronous: true);
         api.Event.ChatMessage += OnChatMessage;
 
         RegisterCommands(api);
@@ -114,7 +116,7 @@ public class TranslocatorPathModSystem : ModSystem
 
     public override void Dispose()
     {
-        Store?.SaveIfDirty();
+        Store?.SaveIfDirty(synchronous: true);
         base.Dispose();
     }
 
