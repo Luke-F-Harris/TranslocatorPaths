@@ -95,6 +95,7 @@ public class TranslocatorStore
     private string _shareDir = "";
     private string _worldFile = "";
     private bool _dirty;
+    private int _version;
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -109,6 +110,23 @@ public class TranslocatorStore
     };
 
     public TranslocatorStore(ICoreClientAPI capi) => _capi = capi;
+
+    /// <summary>Monotonic change counter, bumped on every mutation that can
+    /// affect a snapshot (entries, groups, visibility, colours). Callers that
+    /// cache <see cref="SnapshotVisible"/> results compare against this to
+    /// know when to re-fetch instead of snapshotting every frame.</summary>
+    public int Version
+    {
+        get { lock (_lock) return _version; }
+    }
+
+    /// <summary>Mark state changed while holding <see cref="_lock"/>:
+    /// schedules a save and invalidates cached snapshots.</summary>
+    private void MarkDirtyLocked()
+    {
+        _dirty = true;
+        _version++;
+    }
 
     public static long PosKey(BlockPos p) =>
         ((long)p.X * 73856093) ^ ((long)p.Y * 19349663) ^ ((long)p.Z * 83492791);
@@ -259,6 +277,7 @@ public class TranslocatorStore
             _groups.Clear();
             EnsureSelfGroup();
             LoadWorldFile();
+            _version++;
         }
         ImportDropFolder();
     }
@@ -300,6 +319,7 @@ public class TranslocatorStore
             {
                 ex.ChunkIdx = chunkIdx;
                 ex.Dst = dst;
+                _version++; // Dst may have changed; not persisted-worthy but snapshots must refresh
                 return false;
             }
             // Already stored from the far end as B->A — keep just the one.
@@ -309,7 +329,7 @@ public class TranslocatorStore
             {
                 Src = src, Dst = dst, GroupId = SelfGroupId, Origin = "", ChunkIdx = chunkIdx,
             };
-            _dirty = true;
+            MarkDirtyLocked();
             return true;
         }
     }
@@ -322,6 +342,7 @@ public class TranslocatorStore
                                             && string.IsNullOrEmpty(kv.Value.Origin))
                                 .Select(kv => kv.Key).ToList();
             foreach (var k in gone) _entries.Remove(k);
+            if (gone.Count > 0) _version++;
         }
     }
 
@@ -370,7 +391,7 @@ public class TranslocatorStore
         lock (_lock)
         {
             int added = IngestSaveFileLocked(f, fallbackOwner);
-            if (added > 0) _dirty = true;
+            if (added > 0) MarkDirtyLocked();
             return (added, null);
         }
     }
@@ -416,6 +437,9 @@ public class TranslocatorStore
             };
             added++;
         }
+        // Drop-folder imports don't mark dirty (they re-read every session),
+        // but cached snapshots still need to see the new entries.
+        if (added > 0) _version++;
         return added;
     }
 
@@ -530,7 +554,7 @@ public class TranslocatorStore
         {
             if (!_groups.TryGetValue(gid, out var g)) return false;
             g.Color = new Vec4f(col.R, col.G, col.B, g.Color.A);
-            _dirty = true;
+            MarkDirtyLocked();
             return true;
         }
     }
@@ -542,7 +566,7 @@ public class TranslocatorStore
             if (!_groups.TryGetValue(gid, out var g) || string.IsNullOrWhiteSpace(newName))
                 return false;
             g.Name = newName.Trim();
-            _dirty = true;
+            MarkDirtyLocked();
             return true;
         }
     }
@@ -580,7 +604,7 @@ public class TranslocatorStore
                 Color = ParseColor(hex ?? "#35DDAC"), Imported = false,
             };
             _groups[gid] = g;
-            _dirty = true;
+            MarkDirtyLocked();
             return g;
         }
     }
@@ -592,7 +616,7 @@ public class TranslocatorStore
             var g = FindGroupByNameLocked(name);
             if (g == null) return false;
             g.Color = ParseColor(hex, g.Color.A);
-            _dirty = true;
+            MarkDirtyLocked();
             return true;
         }
     }
@@ -604,7 +628,7 @@ public class TranslocatorStore
             var g = FindGroupByNameLocked(oldName);
             if (g == null) return false;
             g.Name = newName;
-            _dirty = true;
+            MarkDirtyLocked();
             return true;
         }
     }
@@ -618,7 +642,7 @@ public class TranslocatorStore
             if (g == null) return false;
             g.Visible = !g.Visible;
             nowVisible = g.Visible;
-            _dirty = true;
+            MarkDirtyLocked();
             return true;
         }
     }
@@ -627,7 +651,7 @@ public class TranslocatorStore
     {
         lock (_lock)
         {
-            if (_groups.TryGetValue(gid, out var g)) { g.Visible = visible; _dirty = true; }
+            if (_groups.TryGetValue(gid, out var g)) { g.Visible = visible; MarkDirtyLocked(); }
         }
     }
 
@@ -640,7 +664,7 @@ public class TranslocatorStore
             foreach (var e in _entries.Values.Where(e => e.GroupId == g.Id))
                 e.GroupId = SelfGroupId;
             _groups.Remove(g.Id);
-            _dirty = true;
+            MarkDirtyLocked();
             return true;
         }
     }
@@ -669,7 +693,7 @@ public class TranslocatorStore
             if (best == null) return (false, null);
             best.GroupId = g.Id;
             best.Origin = "";
-            _dirty = true;
+            MarkDirtyLocked();
             return (true, best.Src);
         }
     }
@@ -684,7 +708,7 @@ public class TranslocatorStore
             if (!_groups.ContainsKey(groupId)) return false;
             e.GroupId = groupId;
             if (!IsImportedGroup(groupId)) e.Origin = ""; // now player-owned
-            _dirty = true;
+            MarkDirtyLocked();
             return true;
         }
     }

@@ -38,6 +38,13 @@ public class TranslocatorPathLayer : MapLayer
     private readonly Vec4f _lineCol = new();
     private readonly Vec4f _endCol = new();
 
+    // Snapshot cache: SnapshotVisible() takes the store lock and allocates a
+    // full list, and Render + OnMouseMoveClient used to call it every frame /
+    // every mouse move. The store's Version counter tells us when the data
+    // actually changed, so we only re-snapshot then.
+    private List<TranslocatorStore.RenderItem>? _snapshot;
+    private int _snapshotVersion = -1;
+
     public static float ScanIntervalSec = 3f;
     public static int MaxLinks = 2000;
     public static float LineThicknessPx = 2.5f;
@@ -54,6 +61,19 @@ public class TranslocatorPathLayer : MapLayer
     public override bool RequireChunkLoaded => false;
 
     private static TranslocatorStore? Store => TranslocatorPathModSystem.Store;
+
+    /// <summary>The current visible-entry snapshot, re-fetched from the store
+    /// only when its Version says something changed.</summary>
+    private List<TranslocatorStore.RenderItem> VisibleItems(TranslocatorStore store)
+    {
+        int v = store.Version;
+        if (_snapshot == null || v != _snapshotVersion)
+        {
+            _snapshot = store.SnapshotVisible();
+            _snapshotVersion = v;
+        }
+        return _snapshot;
+    }
 
     public override void OnLoaded()
     {
@@ -152,7 +172,7 @@ public class TranslocatorPathLayer : MapLayer
         var store = Store;
         if (store == null) return;
 
-        var items = store.SnapshotVisible();
+        var items = VisibleItems(store);
         if (items.Count == 0) return;
 
         _quad ??= _capi.Render.UploadMesh(QuadMeshUtil.GetQuad());
@@ -228,7 +248,7 @@ public class TranslocatorPathLayer : MapLayer
         if (_capi == null || !Active) return;
         var store = Store;
         if (store == null) return;
-        var items = store.SnapshotVisible();
+        var items = VisibleItems(store);
         if (items.Count == 0) return;
 
         var spawn = _capi.World.DefaultSpawnPosition.AsBlockPos;
