@@ -38,6 +38,20 @@ public class TranslocatorPathLayer : MapLayer
     private readonly Vec4f _lineCol = new();
     private readonly Vec4f _endCol = new();
 
+    /// <summary>Screen-space endpoint positions captured during Render, so
+    /// the hover / right-click hit tests reuse this frame's projections
+    /// instead of re-projecting (and, for right-click, distance-sorting)
+    /// every entry per event.</summary>
+    private struct HitPoint
+    {
+        public float X, Y;
+        public int ItemIndex; // into _renderedItems
+        public bool IsSrc;
+    }
+
+    private readonly List<HitPoint> _hitPoints = new();
+    private List<TranslocatorStore.RenderItem> _renderedItems = new();
+
     public static float ScanIntervalSec = 3f;
     public static int MaxLinks = 2000;
     public static float LineThicknessPx = 2.5f;
@@ -153,6 +167,8 @@ public class TranslocatorPathLayer : MapLayer
         if (store == null) return;
 
         var items = store.SnapshotVisible();
+        _renderedItems = items;
+        _hitPoints.Clear();
         if (items.Count == 0) return;
 
         _quad ??= _capi.Render.UploadMesh(QuadMeshUtil.GetQuad());
@@ -171,8 +187,9 @@ public class TranslocatorPathLayer : MapLayer
         var srcWorld = new Vec3d();
         var dstWorld = new Vec3d();
 
-        foreach (var item in items)
+        for (int i = 0; i < items.Count; i++)
         {
+            var item = items[i];
             srcWorld.Set(item.Src.X + 0.5, item.Src.Y, item.Src.Z + 0.5);
             dstWorld.Set(item.Dst.X + 0.5, item.Dst.Y, item.Dst.Z + 0.5);
             map.TranslateWorldPosToViewPos(srcWorld, ref aPos);
@@ -186,6 +203,11 @@ public class TranslocatorPathLayer : MapLayer
             if (OffSameSide(ax, bx, map.Bounds.renderX, map.Bounds.renderX + map.Bounds.InnerWidth) ||
                 OffSameSide(ay, by, map.Bounds.renderY, map.Bounds.renderY + map.Bounds.InnerHeight))
                 continue;
+
+            // Culled endpoints are off-screen and can't be hovered/clicked,
+            // so recording only surviving items keeps the hit list small.
+            _hitPoints.Add(new HitPoint { X = ax, Y = ay, ItemIndex = i, IsSrc = true });
+            _hitPoints.Add(new HitPoint { X = bx, Y = by, ItemIndex = i, IsSrc = false });
 
             float dx = bx - ax;
             float dy = by - ay;
@@ -223,39 +245,36 @@ public class TranslocatorPathLayer : MapLayer
         return (a < lo - m && b < lo - m) || (a > hi + m && b > hi + m);
     }
 
+    /// <summary>Find the hit-cache entry under the cursor, if any. Uses the
+    /// screen positions Render already computed this frame instead of
+    /// re-projecting every entry per mouse event.</summary>
+    private bool TryHit(double mx, double my, out TranslocatorStore.RenderItem item)
+    {
+        item = default;
+        double hit = RuntimeEnv.GUIScale * 6;
+        for (int i = 0; i < _hitPoints.Count; i++)
+        {
+            var p = _hitPoints[i];
+            if (Math.Abs(mx - p.X) >= hit || Math.Abs(my - p.Y) >= hit) continue;
+            if (p.ItemIndex >= _renderedItems.Count) continue; // stale frame guard
+            item = _renderedItems[p.ItemIndex];
+            return true;
+        }
+        return false;
+    }
+
     public override void OnMouseMoveClient(MouseEvent args, GuiElementMap map, StringBuilder hoverText)
     {
         if (_capi == null || !Active) return;
-        var store = Store;
-        if (store == null) return;
-        var items = store.SnapshotVisible();
-        if (items.Count == 0) return;
+        if (!TryHit(args.X, args.Y, out var item)) return;
 
         var spawn = _capi.World.DefaultSpawnPosition.AsBlockPos;
-        var vp = new Vec2f();
-        var world = new Vec3d();
-        double hit = RuntimeEnv.GUIScale * 6;
-
-        foreach (var item in items)
-        {
-            for (int end = 0; end < 2; end++)
-            {
-                var p = end == 0 ? item.Src : item.Dst;
-                world.Set(p.X + 0.5, p.Y, p.Z + 0.5);
-                map.TranslateWorldPosToViewPos(world, ref vp);
-                double sx = map.Bounds.renderX + vp.X;
-                double sy = map.Bounds.renderY + vp.Y;
-                if (Math.Abs(args.X - sx) >= hit || Math.Abs(args.Y - sy) >= hit) continue;
-
-                var s = item.Src; var d = item.Dst;
-                string who = string.IsNullOrEmpty(item.Origin) ? "you" : item.Origin;
-                hoverText.AppendLine(
-                    $"[{item.GroupName}] (via {who})\n" +
-                    $"Translocator {s.X - spawn.X}, {s.Y}, {s.Z - spawn.Z}\n" +
-                    $"  -> {d.X - spawn.X}, {d.Y}, {d.Z - spawn.Z}");
-                return;
-            }
-        }
+        var s = item.Src; var d = item.Dst;
+        string who = string.IsNullOrEmpty(item.Origin) ? "you" : item.Origin;
+        hoverText.AppendLine(
+            $"[{item.GroupName}] (via {who})\n" +
+            $"Translocator {s.X - spawn.X}, {s.Y}, {s.Z - spawn.Z}\n" +
+            $"  -> {d.X - spawn.X}, {d.Y}, {d.Z - spawn.Z}");
     }
 
     private TranslocatorPathEditDialog? _editDlg;
@@ -267,36 +286,17 @@ public class TranslocatorPathLayer : MapLayer
     {
         if (_capi == null || !Active || args.Handled) return;
         if (args.Button != EnumMouseButton.Right) return;
-        var store = Store;
-        if (store == null) return;
 
-        var ppos = _capi.World?.Player?.Entity?.Pos;
-        var near = ppos != null ? new Vec3d(ppos.X, ppos.Y, ppos.Z) : new Vec3d();
-        var rows = store.SnapshotEntries(near);
-        if (rows.Count == 0) return;
+        // Previously this snapshotted and distance-sorted EVERY entry
+        // (including hidden groups) per right-click; the hit cache covers
+        // exactly what is drawn, so hidden-group endpoints - which were
+        // invisible yet clickable - no longer react.
+        if (!TryHit(args.X, args.Y, out var item)) return;
 
-        var vp = new Vec2f();
-        var world = new Vec3d();
-        double hitR = RuntimeEnv.GUIScale * 6;
-
-        foreach (var row in rows)
-        {
-            for (int end = 0; end < 2; end++)
-            {
-                var p = end == 0 ? row.Src : row.Dst;
-                world.Set(p.X + 0.5, p.Y, p.Z + 0.5);
-                map.TranslateWorldPosToViewPos(world, ref vp);
-                double sx = map.Bounds.renderX + vp.X;
-                double sy = map.Bounds.renderY + vp.Y;
-                if (Math.Abs(args.X - sx) >= hitR || Math.Abs(args.Y - sy) >= hitR) continue;
-
-                if (_editDlg != null) { _editDlg.TryClose(); _editDlg.Dispose(); }
-                _editDlg = new TranslocatorPathEditDialog(_capi, row.Key);
-                _editDlg.TryOpen();
-                args.Handled = true;
-                return;
-            }
-        }
+        if (_editDlg != null) { _editDlg.TryClose(); _editDlg.Dispose(); }
+        _editDlg = new TranslocatorPathEditDialog(_capi, item.Key);
+        _editDlg.TryOpen();
+        args.Handled = true;
     }
 
     public override void Dispose()

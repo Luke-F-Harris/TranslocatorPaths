@@ -693,13 +693,14 @@ public class TranslocatorStore
 
     public readonly struct RenderItem
     {
+        public readonly long Key;
         public readonly BlockPos Src;
         public readonly BlockPos Dst;
         public readonly Vec4f Color;
         public readonly string GroupName;
         public readonly string Origin;
-        public RenderItem(BlockPos s, BlockPos d, Vec4f c, string gn, string o)
-        { Src = s; Dst = d; Color = c; GroupName = gn; Origin = o; }
+        public RenderItem(long k, BlockPos s, BlockPos d, Vec4f c, string gn, string o)
+        { Key = k; Src = s; Dst = d; Color = c; GroupName = gn; Origin = o; }
     }
 
     public List<RenderItem> SnapshotVisible()
@@ -707,11 +708,12 @@ public class TranslocatorStore
         lock (_lock)
         {
             var outl = new List<RenderItem>(_entries.Count);
-            foreach (var e in _entries.Values)
+            foreach (var kv in _entries)
             {
+                var e = kv.Value;
                 if (!_groups.TryGetValue(e.GroupId, out var g)) g = _groups[SelfGroupId];
                 if (!g.Visible) continue;
-                outl.Add(new RenderItem(e.Src, e.Dst, g.Color, g.Name, e.Origin));
+                outl.Add(new RenderItem(kv.Key, e.Src, e.Dst, g.Color, g.Name, e.Origin));
             }
             return outl;
         }
