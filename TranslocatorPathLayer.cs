@@ -119,14 +119,27 @@ public class TranslocatorPathLayer : MapLayer
         try { indices = _capi.World.LoadedChunkIndices; }
         catch { return; }
 
-        foreach (long idx in indices)
+        // Claim all unscanned chunks in ONE lock acquisition. The previous
+        // per-chunk lock meant a steady-state tick (everything already
+        // scanned) still took the lock once per loaded chunk - thousands of
+        // acquisitions to discover there was nothing to do.
+        List<long>? fresh = null;
+        lock (_scanLock)
         {
-            lock (_scanLock)
-            {
-                if (!_scannedChunks.Add(idx)) continue;
-            }
+            foreach (long idx in indices)
+                if (_scannedChunks.Add(idx)) (fresh ??= new List<long>()).Add(idx);
+        }
+        if (fresh == null) return;
 
-            var bes = ba.GetChunk(idx)?.BlockEntities;
+        // Track the entry count locally: store.TotalCount takes the store
+        // lock, and the previous code queried it once per block entity.
+        int total = store.TotalCount;
+
+        for (int i = 0; i < fresh.Count; i++)
+        {
+            if (total >= MaxLinks) { UnclaimFrom(fresh, i); return; }
+
+            var bes = ba.GetChunk(fresh[i])?.BlockEntities;
             if (bes == null || bes.Count == 0) continue;
 
             foreach (var be in bes.Values)
@@ -140,10 +153,21 @@ public class TranslocatorPathLayer : MapLayer
                 if (src == null) continue;
                 if (tl.tpLocationIsOffset) dst = dst.AddCopy(src.X, src.Y, src.Z);
 
-                if (store.TotalCount >= MaxLinks) return;
-                store.AddDiscovered(src.Copy(), dst.Copy(), idx);
+                if (total >= MaxLinks) { UnclaimFrom(fresh, i + 1); return; }
+                if (store.AddDiscovered(src.Copy(), dst.Copy(), fresh[i])) total++;
             }
         }
+    }
+
+    /// <summary>Give back chunks that were claimed up-front but never scanned
+    /// because the MaxLinks cap was hit, so a later tick (or a raised cap via
+    /// .tllinesmax) can still pick them up. The chunk being scanned when the
+    /// cap is hit stays claimed, matching the previous behaviour.</summary>
+    private void UnclaimFrom(List<long> fresh, int start)
+    {
+        if (start >= fresh.Count) return;
+        lock (_scanLock)
+            for (int i = start; i < fresh.Count; i++) _scannedChunks.Remove(fresh[i]);
     }
 
     public override void Render(GuiElementMap map, float dt)
