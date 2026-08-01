@@ -65,6 +65,11 @@ public class TranslocatorPathLayer : MapLayer
 
     public override void OnMapOpenedClient()
     {
+        // Drop any pan left over from the previous time the map was open;
+        // the map element may have been rebuilt since.
+        _panMap = null;
+        _panTarget = null;
+
         Store?.ImportDropFolder();
         ScanNewChunks();
     }
@@ -149,6 +154,9 @@ public class TranslocatorPathLayer : MapLayer
     public override void Render(GuiElementMap map, float dt)
     {
         if (_capi == null || !Active) return;
+
+        AdvancePan(map, dt);
+
         var store = Store;
         if (store == null) return;
 
@@ -260,9 +268,59 @@ public class TranslocatorPathLayer : MapLayer
 
     private TranslocatorPathEditDialog? _editDlg;
 
+    // ---- click-to-pan ------------------------------------------------------
+
+    /// <summary>Smooth-pan state. Scoped to the exact GuiElementMap that
+    /// initiated it: the world-map dialog and the HUD minimap are separate
+    /// map elements rendering the same layers, and a pan started on one must
+    /// never move the other.</summary>
+    private GuiElementMap? _panMap;
+    private BlockPos? _panTarget;
+
+    /// <summary>Start smoothly panning <paramref name="map"/> until
+    /// <paramref name="target"/> is centred. Advanced each frame in Render;
+    /// cancelled the moment the player drags the map themselves.</summary>
+    public void BeginPanTo(GuiElementMap map, BlockPos target)
+    {
+        _panMap = map;
+        _panTarget = target;
+    }
+
+    private void AdvancePan(GuiElementMap map, float dt)
+    {
+        if (_panTarget == null || !ReferenceEquals(_panMap, map)) return;
+        if (map.IsDragingMap) { _panMap = null; _panTarget = null; return; }
+
+        var b = map.CurrentBlockViewBounds;
+        double dx = _panTarget.X + 0.5 - (b.X1 + b.X2) / 2.0;
+        double dz = _panTarget.Z + 0.5 - (b.Z1 + b.Z2) / 2.0;
+
+        // Within a block of centre: snap exact and finish.
+        if (dx * dx + dz * dz < 1)
+        {
+            map.CenterMapTo(_panTarget);
+            _panMap = null;
+            _panTarget = null;
+            return;
+        }
+
+        // Framerate-independent ease-out: close ~99.8% of the remaining
+        // distance per second. Long teleport hops start fast, land gently.
+        double f = 1 - Math.Exp(-dt * 6);
+        b.Translate(dx * f, 0, dz * f);
+    }
+
+    private bool IsJumpModifierDown()
+    {
+        var keys = _capi!.Input.KeyboardKeyStateRaw;
+        return keys[(int)GlKeys.ShiftLeft] || keys[(int)GlKeys.ShiftRight]
+            || keys[(int)GlKeys.ControlLeft] || keys[(int)GlKeys.ControlRight];
+    }
+
     /// <summary>Right-click a translocator endpoint on the map to open the
-    /// per-translocator group picker. Left-click is left alone so map panning
-    /// still works.</summary>
+    /// per-translocator group picker; with Ctrl or Shift held, instead pan
+    /// the map to the endpoint's other end. Left-click is left alone so map
+    /// panning still works.</summary>
     public override void OnMouseUpClient(MouseEvent args, GuiElementMap map)
     {
         if (_capi == null || !Active || args.Handled) return;
@@ -290,8 +348,19 @@ public class TranslocatorPathLayer : MapLayer
                 double sy = map.Bounds.renderY + vp.Y;
                 if (Math.Abs(args.X - sx) >= hitR || Math.Abs(args.Y - sy) >= hitR) continue;
 
+                // The link's far side, relative to the endpoint clicked.
+                var other = end == 0 ? row.Dst : row.Src;
+
+                if (IsJumpModifierDown())
+                {
+                    BeginPanTo(map, other);
+                    args.Handled = true;
+                    return;
+                }
+
                 if (_editDlg != null) { _editDlg.TryClose(); _editDlg.Dispose(); }
-                _editDlg = new TranslocatorPathEditDialog(_capi, row.Key);
+                _editDlg = new TranslocatorPathEditDialog(_capi, row.Key,
+                    () => BeginPanTo(map, other));
                 _editDlg.TryOpen();
                 args.Handled = true;
                 return;

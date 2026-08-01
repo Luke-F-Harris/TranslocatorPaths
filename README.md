@@ -18,6 +18,10 @@ it teleports you to, so you can see your translocator network at a glance.
 - **In-game GUI** — open with the `K` hotkey (or `.tlgui`) to manage groups and
   reassign translocators. Right-click a translocator endpoint on the map to
   change its group directly.
+- **Jump to the other end** — Ctrl- or Shift-right-click a translocator
+  endpoint on the map to smoothly pan the map to where it leads (or use the
+  "Show other end" button in the right-click dialog). Dragging the map
+  cancels the pan.
 
 ## Usage
 

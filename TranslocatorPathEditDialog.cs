@@ -19,9 +19,15 @@ public class TranslocatorPathEditDialog : GuiDialogGeneric
     private const string DropId = "tpgroupdd";
     private const string SwatchId = "tpgroupsw";
     private readonly long _key;
+    private readonly Action? _onShowOtherEnd;
 
-    public TranslocatorPathEditDialog(ICoreClientAPI capi, long entryKey)
-        : base("", capi) => _key = entryKey;
+    public TranslocatorPathEditDialog(ICoreClientAPI capi, long entryKey,
+        Action? onShowOtherEnd = null)
+        : base("", capi)
+    {
+        _key = entryKey;
+        _onShowOtherEnd = onShowOtherEnd;
+    }
 
     public override string ToggleKeyCombinationCode => "translocatorpath-edit";
     public override EnumDialogType DialogType => EnumDialogType.Dialog;
@@ -68,6 +74,7 @@ public class TranslocatorPathEditDialog : GuiDialogGeneric
         var swatch = ElementBounds.Fixed(0, 0, 22, 22).FixedUnder(line2, 8);
         var dropd = ElementBounds.Fixed(30, 0, 290, 28).FixedUnder(line2, 5);
         var closeBtn = ElementBounds.Fixed(0, 0, 100, 26).FixedUnder(dropd, 14);
+        var showBtn = ElementBounds.Fixed(170, 0, 150, 26).FixedUnder(dropd, 14);
 
         SingleComposer?.Dispose();
         SingleComposer = capi.Gui.CreateCompo("translocatorpath-edit", dialogBounds)
@@ -78,7 +85,15 @@ public class TranslocatorPathEditDialog : GuiDialogGeneric
                 .AddStaticText("Group:", CairoFont.WhiteDetailText(), line2)
                 .AddColorListPicker(new[] { swatchColor }, _ => { }, swatch, 30, SwatchId)
                 .AddDropDown(ids, names, sel, OnGroupChanged, dropd, DropId)
-                .AddSmallButton("Close", () => { TryClose(); return true; }, closeBtn)
+                .AddSmallButton("Close", () => { TryClose(); return true; }, closeBtn);
+
+        // Pans the world map to the link's far side. Close first so the
+        // player sees the map travel unobstructed.
+        if (_onShowOtherEnd != null)
+            SingleComposer.AddSmallButton("Show other end",
+                () => { TryClose(); _onShowOtherEnd(); return true; }, showBtn);
+
+        SingleComposer = SingleComposer
             .EndChildElements()
             .Compose();
 
