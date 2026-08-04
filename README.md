@@ -18,6 +18,12 @@ it teleports you to, so you can see your translocator network at a glance.
 - **In-game GUI** — open with the `K` hotkey (or `.tlgui`) to manage groups and
   reassign translocators. Right-click a translocator endpoint on the map to
   change its group directly.
+- **Broken translocator markers** *(optional, off by default)* — enable "Show
+  broken translocators" in the GUI to also mark discovered-but-unrepaired
+  translocators on the map (a red "Broken" group). They have no line — a
+  translocator's destination only exists once repaired; rescan after repairing
+  and the marker upgrades to a normal line. Broken markers are never included
+  in exports or chat shares.
 
 ## Usage
 

@@ -41,6 +41,20 @@ public class TranslocatorPathModSystem : ModSystem
         set => _capi.Settings.Bool[AutoScanSettingKey] = value;
     }
 
+    // Global client setting, off by default: also record unrepaired
+    // translocators as destination-less markers in a "Broken" group.
+    private const string ShowBrokenSettingKey = "translocatorpath-showbroken";
+
+    public bool ShowBrokenTranslocators
+    {
+        get => _capi.Settings.Bool.Get(ShowBrokenSettingKey, false);
+        set
+        {
+            _capi.Settings.Bool[ShowBrokenSettingKey] = value;
+            if (Store != null) Store.ShowBroken = value;
+        }
+    }
+
     private static readonly Regex ShareLinkRegex = new(
         @"\[tlpath\]\s+(https?://paste\.rs/[A-Za-z0-9./_-]+)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -103,6 +117,7 @@ public class TranslocatorPathModSystem : ModSystem
         api.Event.LevelFinalize += () =>
         {
             Store = new TranslocatorStore(api);
+            Store.ShowBroken = ShowBrokenTranslocators;
             Store.Init();
         };
         api.Event.RegisterGameTickListener(_ => Store?.SaveIfDirty(), 5000);

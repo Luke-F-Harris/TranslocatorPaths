@@ -77,18 +77,20 @@ public class TranslocatorPathDialog : GuiDialogGeneric
         var bSave = Btn(0, 40); var bReload = Btn(1, 40); var bImport = Btn(2, 40);
         var bExport = Btn(0, 78); var bHere = Btn(1, 78); var bAll = Btn(2, 78);
 
-        // Settings/share row.
+        // Settings/share rows.
         var autoScanLbl = ElementBounds.Fixed(20, 120, 200, 24);
         var autoScanSwitch = ElementBounds.Fixed(224, 116, 30, 30);
         var shareChatBtn = Btn(2, 116);
+        var brokenLbl = ElementBounds.Fixed(20, 158, 200, 24);
+        var brokenSwitch = ElementBounds.Fixed(224, 154, 30, 30);
 
-        var grpHeader = ElementBounds.Fixed(20, 160, 240, 24);
-        var gPrev = ElementBounds.Fixed(Width - 150, 158, 54, 26);
-        var gNext = ElementBounds.Fixed(Width - 90, 158, 54, 26);
-        var newGrpInput = ElementBounds.Fixed(20, 190, 360, 28);
-        var addGrpBtn = ElementBounds.Fixed(392, 189, 130, 30);
+        var grpHeader = ElementBounds.Fixed(20, 198, 240, 24);
+        var gPrev = ElementBounds.Fixed(Width - 150, 196, 54, 26);
+        var gNext = ElementBounds.Fixed(Width - 90, 196, 54, 26);
+        var newGrpInput = ElementBounds.Fixed(20, 228, 360, 28);
+        var addGrpBtn = ElementBounds.Fixed(392, 227, 130, 30);
 
-        int groupsTop = 234;
+        int groupsTop = 272;
         int groupsBottom = groupsTop + gRows * gRowStep;
 
         int lhY = groupsBottom + 18;
@@ -124,6 +126,8 @@ public class TranslocatorPathDialog : GuiDialogGeneric
             .AddStaticText("Auto-scan chat shares", CairoFont.WhiteSmallText(), autoScanLbl)
             .AddSwitch(OnToggleAutoScan, autoScanSwitch, "autoscan", 28)
             .AddSmallButton("Share via Chat", OnShareViaChat, shareChatBtn)
+            .AddStaticText("Show broken translocators", CairoFont.WhiteSmallText(), brokenLbl)
+            .AddSwitch(OnToggleShowBroken, brokenSwitch, "showbroken", 28)
             .AddStaticText($"Groups ({_groupPage + 1}/{gTotalPages})", CairoFont.WhiteSmallText(), grpHeader)
             .AddSmallButton("<", () => { _groupPage--; RebuildUi(); return true; }, gPrev)
             .AddSmallButton(">", () => { _groupPage++; RebuildUi(); return true; }, gNext)
@@ -212,10 +216,26 @@ public class TranslocatorPathDialog : GuiDialogGeneric
 
         var modsys = TranslocatorPathModSystem.Instance;
         if (modsys != null)
+        {
             SingleComposer.GetSwitch("autoscan").On = modsys.AutoScanChatShare;
+            SingleComposer.GetSwitch("showbroken").On = modsys.ShowBrokenTranslocators;
+        }
 
         for (int i = 0; i < groups.Count; i++)
             SingleComposer.ColorListPickerSetValue("gsw_" + i, 0);
+    }
+
+    private void OnToggleShowBroken(bool on)
+    {
+        var modsys = TranslocatorPathModSystem.Instance;
+        if (modsys == null) return;
+        modsys.ShowBrokenTranslocators = on;
+        // Already-scanned chunks never re-report, so pick up the broken ones
+        // sitting in loaded chunks right away.
+        if (on) Layer()?.RescanAll();
+        capi.TriggerChatMessage(
+            $"[translocatorpath] Broken translocator markers {(on ? "ENABLED" : "disabled")}.");
+        RebuildUi();
     }
 
     private void OnToggleAutoScan(bool on)

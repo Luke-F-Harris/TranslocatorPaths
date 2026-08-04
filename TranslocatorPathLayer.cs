@@ -132,12 +132,23 @@ public class TranslocatorPathLayer : MapLayer
             foreach (var be in bes.Values)
             {
                 if (be is not BlockEntityStaticTranslocator tl) continue;
-                if (!tl.FullyRepaired) continue;
+                var src = tl.Pos;
+                if (src == null) continue;
+
+                if (!tl.FullyRepaired)
+                {
+                    // No destination exists until it's repaired; record a
+                    // position-only marker, and only when the setting is on.
+                    if (store.ShowBroken)
+                    {
+                        if (store.TotalCount >= MaxLinks) return;
+                        store.AddBroken(src.Copy(), idx);
+                    }
+                    continue;
+                }
 
                 var dst = tl.TargetLocation;
                 if (dst == null) continue;
-                var src = tl.Pos;
-                if (src == null) continue;
                 if (tl.tpLocationIsOffset) dst = dst.AddCopy(src.X, src.Y, src.Z);
 
                 if (store.TotalCount >= MaxLinks) return;
@@ -186,6 +197,15 @@ public class TranslocatorPathLayer : MapLayer
             if (OffSameSide(ax, bx, map.Bounds.renderX, map.Bounds.renderX + map.Bounds.InnerWidth) ||
                 OffSameSide(ay, by, map.Bounds.renderY, map.Bounds.renderY + map.Bounds.InnerHeight))
                 continue;
+
+            if (item.Broken)
+            {
+                // Destination unknown until repaired: just the source marker.
+                var rgbB = item.Color;
+                _endCol.Set(rgbB.R, rgbB.G, rgbB.B, 1f);
+                DrawQuad(api, prog, ax, ay, 0f, MarkerSizePx / 2f, MarkerSizePx / 2f, _endCol);
+                continue;
+            }
 
             float dx = bx - ax;
             float dy = by - ay;
@@ -248,6 +268,14 @@ public class TranslocatorPathLayer : MapLayer
                 if (Math.Abs(args.X - sx) >= hit || Math.Abs(args.Y - sy) >= hit) continue;
 
                 var s = item.Src; var d = item.Dst;
+                if (item.Broken)
+                {
+                    hoverText.AppendLine(
+                        $"[{item.GroupName}] Broken translocator\n" +
+                        $"{s.X - spawn.X}, {s.Y}, {s.Z - spawn.Z}\n" +
+                        "Repair it to reveal its destination");
+                    return;
+                }
                 string who = string.IsNullOrEmpty(item.Origin) ? "you" : item.Origin;
                 hoverText.AppendLine(
                     $"[{item.GroupName}] (via {who})\n" +

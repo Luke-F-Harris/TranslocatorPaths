@@ -34,6 +34,10 @@ public class TlEntryDto
     public int Dz { get; set; }
     public string GroupId { get; set; } = TranslocatorStore.SelfGroupId;
     public string Origin { get; set; } = "";
+    // True for a discovered-but-unrepaired translocator: Dx/Dy/Dz are
+    // meaningless (set to the source) because the destination only exists
+    // once the translocator is repaired. Absent in older save files -> false.
+    public bool Broken { get; set; }
 }
 
 public class TlSaveFile
@@ -69,6 +73,7 @@ public class TlEntry
     public string GroupId = TranslocatorStore.SelfGroupId;
     public string Origin = "";
     public long ChunkIdx;
+    public bool Broken;
 }
 
 /// <summary>
@@ -83,6 +88,13 @@ public class TlEntry
 public class TranslocatorStore
 {
     public const string SelfGroupId = "self";
+    public const string BrokenGroupId = "broken";
+
+    /// <summary>Runtime mirror of the "show broken translocators" client
+    /// setting (owned by the mod system). Gates whether broken entries appear
+    /// in render snapshots; scanning also checks it so nothing is recorded
+    /// while the feature is off.</summary>
+    public bool ShowBroken { get; set; }
 
     private readonly ICoreClientAPI _capi;
     private readonly object _lock = new();
@@ -175,6 +187,18 @@ public class TranslocatorStore
             };
     }
 
+    /// <summary>Created lazily on the first broken translocator so worlds
+    /// that never enable the feature don't show an empty "Broken" group.</summary>
+    private void EnsureBrokenGroupLocked()
+    {
+        if (!_groups.ContainsKey(BrokenGroupId))
+            _groups[BrokenGroupId] = new TlGroup
+            {
+                Id = BrokenGroupId, Name = "Broken", Visible = true,
+                Color = new Vec4f(1f, 0.23f, 0.23f, 1f), Imported = false,
+            };
+    }
+
     // ---- persistence -----------------------------------------------------
 
     private void LoadWorldFile()
@@ -193,6 +217,7 @@ public class TranslocatorStore
             EnsureSelfGroup();
             foreach (var e in f.Entries)
             {
+                if (e.Broken) EnsureBrokenGroupLocked();
                 var src = new BlockPos(e.Sx, e.Sy, e.Sz);
                 _entries[PosKey(src)] = new TlEntry
                 {
@@ -200,6 +225,7 @@ public class TranslocatorStore
                     Dst = new BlockPos(e.Dx, e.Dy, e.Dz),
                     GroupId = _groups.ContainsKey(e.GroupId) ? e.GroupId : SelfGroupId,
                     Origin = e.Origin ?? "",
+                    Broken = e.Broken,
                 };
             }
         }
@@ -276,7 +302,7 @@ public class TranslocatorStore
     {
         Sx = e.Src.X, Sy = e.Src.Y, Sz = e.Src.Z,
         Dx = e.Dst.X, Dy = e.Dst.Y, Dz = e.Dst.Z,
-        GroupId = e.GroupId, Origin = e.Origin,
+        GroupId = e.GroupId, Origin = e.Origin, Broken = e.Broken,
     };
 
     // ---- discovery -------------------------------------------------------
@@ -300,6 +326,14 @@ public class TranslocatorStore
             {
                 ex.ChunkIdx = chunkIdx;
                 ex.Dst = dst;
+                // A rescan found it repaired: upgrade the broken marker to a
+                // real link in place, moving it out of the Broken group.
+                if (ex.Broken)
+                {
+                    ex.Broken = false;
+                    if (ex.GroupId == BrokenGroupId) ex.GroupId = SelfGroupId;
+                    _dirty = true;
+                }
                 return false;
             }
             // Already stored from the far end as B->A — keep just the one.
@@ -308,6 +342,30 @@ public class TranslocatorStore
             _entries[key] = new TlEntry
             {
                 Src = src, Dst = dst, GroupId = SelfGroupId, Origin = "", ChunkIdx = chunkIdx,
+            };
+            _dirty = true;
+            return true;
+        }
+    }
+
+    /// <summary>Record a discovered-but-unrepaired translocator as a
+    /// destination-less marker in the built-in Broken group. Never downgrades
+    /// an entry that is already known as a repaired link.</summary>
+    public bool AddBroken(BlockPos src, long chunkIdx)
+    {
+        lock (_lock)
+        {
+            long key = PosKey(src);
+            if (_entries.TryGetValue(key, out var ex))
+            {
+                ex.ChunkIdx = chunkIdx;
+                return false;
+            }
+            EnsureBrokenGroupLocked();
+            _entries[key] = new TlEntry
+            {
+                Src = src, Dst = src, GroupId = BrokenGroupId, Origin = "",
+                ChunkIdx = chunkIdx, Broken = true,
             };
             _dirty = true;
             return true;
@@ -456,8 +514,12 @@ public class TranslocatorStore
                 SavegameId = SavegameId,
                 Owner = PlayerName,
                 RefX = rx, RefY = ry, RefZ = rz,
-                Groups = _groups.Values.Where(g => !g.Imported).Select(ToDto).ToList(),
-                Entries = _entries.Values.Select(e => ToRelativeDto(e, rx, ry, rz)).ToList(),
+                Groups = _groups.Values.Where(g => !g.Imported && g.Id != BrokenGroupId)
+                                        .Select(ToDto).ToList(),
+                // Broken markers are local scouting notes, not part of the
+                // shared network - they have no destination to draw.
+                Entries = _entries.Values.Where(e => !e.Broken)
+                                          .Select(e => ToRelativeDto(e, rx, ry, rz)).ToList(),
             };
             return JsonSerializer.Serialize(f, JsonOpts);
         }
@@ -496,7 +558,7 @@ public class TranslocatorStore
                 Owner = PlayerName,
                 RefX = rx, RefY = ry, RefZ = rz,
                 Groups = new() { ToDto(g) },
-                Entries = _entries.Values.Where(e => e.GroupId == gid)
+                Entries = _entries.Values.Where(e => e.GroupId == gid && !e.Broken)
                                           .Select(e => ToRelativeDto(e, rx, ry, rz))
                                           .ToList(),
             };
@@ -636,7 +698,7 @@ public class TranslocatorStore
         lock (_lock)
         {
             var g = FindGroupByNameLocked(name);
-            if (g == null || g.Id == SelfGroupId) return false;
+            if (g == null || g.Id == SelfGroupId || g.Id == BrokenGroupId) return false;
             foreach (var e in _entries.Values.Where(e => e.GroupId == g.Id))
                 e.GroupId = SelfGroupId;
             _groups.Remove(g.Id);
@@ -698,8 +760,9 @@ public class TranslocatorStore
         public readonly Vec4f Color;
         public readonly string GroupName;
         public readonly string Origin;
-        public RenderItem(BlockPos s, BlockPos d, Vec4f c, string gn, string o)
-        { Src = s; Dst = d; Color = c; GroupName = gn; Origin = o; }
+        public readonly bool Broken;
+        public RenderItem(BlockPos s, BlockPos d, Vec4f c, string gn, string o, bool broken)
+        { Src = s; Dst = d; Color = c; GroupName = gn; Origin = o; Broken = broken; }
     }
 
     public List<RenderItem> SnapshotVisible()
@@ -709,9 +772,10 @@ public class TranslocatorStore
             var outl = new List<RenderItem>(_entries.Count);
             foreach (var e in _entries.Values)
             {
+                if (e.Broken && !ShowBroken) continue;
                 if (!_groups.TryGetValue(e.GroupId, out var g)) g = _groups[SelfGroupId];
                 if (!g.Visible) continue;
-                outl.Add(new RenderItem(e.Src, e.Dst, g.Color, g.Name, e.Origin));
+                outl.Add(new RenderItem(e.Src, e.Dst, g.Color, g.Name, e.Origin, e.Broken));
             }
             return outl;
         }
